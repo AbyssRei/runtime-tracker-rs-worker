@@ -125,7 +125,7 @@ async fn scheduled(_event: ScheduledEvent, env: Env, _ctx: ScheduleContext) {
         }
     };
 
-    let config = ai::AiConfig::from_env(&env);
+    let config = ai::AiConfig::from_env_and_kv(&env, &kv_store).await;
     let offset_hours: i32 = utils::get_env_or(&env, "DEFAULT_TIMEZONE_OFFSET", "8")
         .parse()
         .unwrap_or(8);

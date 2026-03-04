@@ -72,8 +72,9 @@ pub async fn login(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
         _ => return json_error("用户名和密码不能为空", 400),
     };
 
-    let admin_user = utils::get_env_or(&ctx.env, "ADMIN_USER", "admin");
-    let admin_passwd = utils::get_env_or(&ctx.env, "ADMIN_PASSWD", "admin");
+    let kv_store = ctx.env.kv("KV")?;
+    let admin_user = kv::get_effective_config(&kv_store, &ctx.env, "ADMIN_USER", "admin").await;
+    let admin_passwd = kv::get_effective_config(&kv_store, &ctx.env, "ADMIN_PASSWD", "admin").await;
 
     if username != admin_user {
         return json_error("用户名或密码错误", 401);
@@ -86,7 +87,6 @@ pub async fn login(mut req: Request, ctx: RouteContext<()>) -> Result<Response> 
 
     // 生成随机 Token
     let token = generate_random_token();
-    let kv_store = ctx.env.kv("KV")?;
 
     let token_data = kv::AuthTokenData {
         username: admin_user,
@@ -173,7 +173,7 @@ pub async fn ai_trigger(mut req: Request, ctx: RouteContext<()>) -> Result<Respo
         .timezone_offset
         .unwrap_or_else(|| get_offset_hours(&ctx));
     let now_ms = Date::now().as_millis();
-    let config = ai::AiConfig::from_env(&ctx.env);
+    let config = ai::AiConfig::from_env_and_kv(&ctx.env, &kv_store).await;
 
     let result = ai::trigger_summary(
         &d1,

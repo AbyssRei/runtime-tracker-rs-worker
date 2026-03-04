@@ -326,7 +326,7 @@ pub async fn ai_trigger(req: Request, ctx: RouteContext<()>) -> Result<Response>
     let kv_store = ctx.env.kv("KV")?;
     let offset_hours = get_offset_hours(&ctx);
     let now_ms = get_now_ms();
-    let config = ai::AiConfig::from_env(&ctx.env);
+    let config = ai::AiConfig::from_env_and_kv(&ctx.env, &kv_store).await;
 
     let date = params.get("date").map(|s| s.as_str());
 
@@ -346,7 +346,8 @@ pub async fn ai_trigger(req: Request, ctx: RouteContext<()>) -> Result<Response>
 
 /// GET /api/ai/status - AI 功能状态
 pub async fn ai_status(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
-    let config = ai::AiConfig::from_env(&ctx.env);
+    let kv_store = ctx.env.kv("KV")?;
+    let config = ai::AiConfig::from_env_and_kv(&ctx.env, &kv_store).await;
     let offset_hours = get_offset_hours(&ctx);
     let status = ai::get_ai_status(&ctx.env, &config, offset_hours);
     Response::from_json(&status)
@@ -356,42 +357,43 @@ pub async fn ai_status(_req: Request, ctx: RouteContext<()>) -> Result<Response>
 
 /// GET /api/pageConfig - 页面组件配置
 pub async fn page_config(_req: Request, ctx: RouteContext<()>) -> Result<Response> {
+    let kv_store = ctx.env.kv("KV")?;
+    let g = |key: &str, default: &str| {
+        let kv = &kv_store;
+        let env = &ctx.env;
+        let key = key.to_string();
+        let default = default.to_string();
+        async move { kv::get_effective_config(kv, env, &key, &default).await }
+    };
+
     let config = PageConfig {
-        web_device_count: utils::parse_bool_env(
-            &utils::get_env_or(&ctx.env, "WEB_DEVICE_COUNT", "true"),
-            true,
-        ),
-        web_comment: utils::parse_bool_env(
-            &utils::get_env_or(&ctx.env, "WEB_COMMENT", "true"),
-            true,
-        ),
-        web_ai_summary: utils::parse_bool_env(
-            &utils::get_env_or(&ctx.env, "AI_SUMMARY_ENABLED", "true"),
-            true,
-        ),
-        web_summary: utils::parse_bool_env(
-            &utils::get_env_or(&ctx.env, "WEB_SUMMARY", "true"),
-            true,
-        ),
-        giscus_repo: utils::get_env_or(&ctx.env, "GISCUS_REPO", ""),
-        giscus_repo_id: utils::get_env_or(&ctx.env, "GISCUS_REPOID", ""),
-        giscus_category: utils::get_env_or(&ctx.env, "GISCUS_CATEGORY", ""),
-        giscus_category_id: utils::get_env_or(&ctx.env, "GISCUS_CATEGORYID", ""),
-        giscus_mapping: utils::get_env_or(&ctx.env, "GISCUS_MAPPING", "pathname"),
+        web_device_count: utils::parse_bool_env(&g("WEB_DEVICE_COUNT", "true").await, true),
+        web_comment: utils::parse_bool_env(&g("WEB_COMMENT", "true").await, true),
+        web_ai_summary: utils::parse_bool_env(&g("AI_SUMMARY_ENABLED", "true").await, true),
+        web_summary: utils::parse_bool_env(&g("WEB_SUMMARY", "true").await, true),
+        giscus_repo: g("GISCUS_REPO", "").await,
+        giscus_repo_id: g("GISCUS_REPOID", "").await,
+        giscus_category: g("GISCUS_CATEGORY", "").await,
+        giscus_category_id: g("GISCUS_CATEGORYID", "").await,
+        giscus_mapping: g("GISCUS_MAPPING", "pathname").await,
         giscus_reactions_enabled: utils::parse_bool_env(
-            &utils::get_env_or(&ctx.env, "GISCUS_REACTIONSENABLED", "true"),
+            &g("GISCUS_REACTIONSENABLED", "true").await,
             true,
         ),
         giscus_emit_metadata: utils::parse_bool_env(
-            &utils::get_env_or(&ctx.env, "GISCUS_EMITMETADATA", "false"),
+            &g("GISCUS_EMITMETADATA", "false").await,
             false,
         ),
-        giscus_input_position: utils::get_env_or(&ctx.env, "GISCUS_INPUTPOSITION", "bottom"),
-        giscus_theme: utils::get_env_or(&ctx.env, "GISCUS_THEME", "light"),
-        giscus_lang: utils::get_env_or(&ctx.env, "GISCUS_LANG", "zh-CN"),
+        giscus_input_position: g("GISCUS_INPUTPOSITION", "bottom").await,
+        giscus_theme: g("GISCUS_THEME", "light").await,
+        giscus_lang: g("GISCUS_LANG", "zh-CN").await,
     };
 
-    let tz_offset = get_offset_hours(&ctx);
+    // DEFAULT_TIMEZONE_OFFSET 也应感知 KV 覆盖
+    let tz_offset: i32 = kv::get_effective_config(&kv_store, &ctx.env, "DEFAULT_TIMEZONE_OFFSET", "8")
+        .await
+        .parse()
+        .unwrap_or(8);
 
     Response::from_json(&serde_json::json!({
         "success": true,

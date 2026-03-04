@@ -246,3 +246,20 @@ pub async fn set_runtime_config(
 ) -> Result<()> {
     kv_put_json(kv, CONFIG_KEY, config, None).await
 }
+
+/// 读取配置值：优先取 KV 运行时覆盖，再回退到 wrangler.toml 环境变量
+///
+/// 使用场景：所有需要感知 `admin/config` 动态修改的配置项都应通过此函数读取。
+pub async fn get_effective_config(
+    kv: &KvStore,
+    env: &worker::Env,
+    key: &str,
+    default: &str,
+) -> String {
+    if let Ok(config) = get_runtime_config(kv).await {
+        if let Some(value) = config.get(key) {
+            return value.clone();
+        }
+    }
+    crate::utils::get_env_or(env, key, default)
+}

@@ -1,6 +1,7 @@
 /// AI 总结服务
 /// 对应原始项目的 AISummary.js
 use crate::kv;
+use crate::kv::KvStore;
 use crate::models::*;
 use crate::services::query;
 use crate::utils::{self, TimezoneHelper};
@@ -20,7 +21,8 @@ pub struct AiConfig {
 }
 
 impl AiConfig {
-    /// 从环境变量构建配置
+    /// 从环境变量构建配置（不含 KV 覆盖，用于无 KV 上下文处的保底调用）
+    #[allow(dead_code)]
     pub fn from_env(env: &Env) -> Self {
         Self {
             api_url: utils::get_env_or(
@@ -44,6 +46,40 @@ impl AiConfig {
             ),
             publish_api_url: utils::get_env_or(env, "PUBLISH_API_URL", ""),
             publish_api_key: utils::get_env_or(env, "PUBLISH_API_KEY", ""),
+        }
+    }
+
+    /// 从环境变量 + KV 运行时覆盖构建配置
+    /// KV 中存储的 `runtime_config` 优先级高于 wrangler.toml `[vars]`。
+    pub async fn from_env_and_kv(env: &Env, kv: &KvStore) -> Self {
+        let g = |key: &str, default: &str| {
+            let kv = &kv;
+            let env = &env;
+            let key = key.to_string();
+            let default = default.to_string();
+            async move { kv::get_effective_config(kv, env, &key, &default).await }
+        };
+
+        let api_url = g("AI_API_URL", "https://api.openai.com/v1/chat/completions").await;
+        let api_key = g("AI_API_KEY", "").await;
+        let model = g("AI_MODEL", "gpt-4").await;
+        let max_tokens = g("AI_MAX_TOKENS", "1000").await.parse().unwrap_or(1000);
+        let prompt_suffix = g("AI_PROMPT", "").await.replace("\\n", "\n");
+        let enabled = utils::parse_bool_env(&g("AI_SUMMARY_ENABLED", "true").await, true);
+        let publish_enabled = utils::parse_bool_env(&g("PUBLISH_ENABLED", "false").await, false);
+        let publish_api_url = g("PUBLISH_API_URL", "").await;
+        let publish_api_key = g("PUBLISH_API_KEY", "").await;
+
+        Self {
+            api_url,
+            api_key,
+            model,
+            max_tokens,
+            prompt_suffix,
+            enabled,
+            publish_enabled,
+            publish_api_url,
+            publish_api_key,
         }
     }
 }
@@ -129,7 +165,7 @@ pub async fn generate_daily_summary(
 
     // 4. 发布总结（如果启用）
     if config.publish_enabled && !config.publish_api_url.is_empty() {
-        let _ = publish_summary(config, device_id, &target_date, &summary).await;
+        let _ = publish_summary(config, device_id, &target_date, &summary, now_ms).await;
     }
 
     // 5. 保存到 KV 缓存
@@ -316,11 +352,12 @@ async fn publish_summary(
     device_id: &str,
     date: &str,
     summary: &str,
+    now_ms: u64,
 ) -> Result<()> {
     let payload = serde_json::json!({
         "deviceId": device_id,
         "date": date,
-        "timestamp": chrono::NaiveDate::from_ymd_opt(1970, 1, 1).map(|_| "").unwrap_or(""),
+        "timestamp": utils::utc_ms_to_iso(now_ms),
         "summary": summary
     });
 
