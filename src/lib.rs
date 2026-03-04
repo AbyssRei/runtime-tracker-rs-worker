@@ -61,6 +61,13 @@ async fn fetch(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         return handle_options();
     }
 
+    // 非 API/Admin 路由：转发给静态资源处理器（SPA 前端）
+    let path = req.url()?.path().to_string();
+    if !path.starts_with("/api") && !path.starts_with("/admin") {
+        let fetcher = env.fetcher("ASSETS")?;
+        return fetcher.fetch(req, None).await;
+    }
+
     let router = Router::new();
 
     let response = router

@@ -17,6 +17,12 @@ Cargo.lock
 .dev.vars
 
 # ========================
+# Frontend Build Output
+# ========================
+dist/
+frontend/.vite/
+
+# ========================
 # Dependencies
 # ========================
 node_modules/

@@ -10,6 +10,7 @@
 - [第一步：获取并配置 GitHub Secrets](#第一步获取并配置-github-secrets)
 - [第二步：一键初始化 & 首次部署](#第二步一键初始化--首次部署)
 - [后续更新](#后续更新)
+- [前端静态资源](#前端静态资源)
 - [FAQ](#faq)
 
 ---
@@ -204,6 +205,48 @@ git push origin main
 - **仅更新代码**：两个选项都保持 `false`（默认）
 - **代码 + 数据库迁移**：`run_migrations` 选 `true`（当有新的迁移文件时）
 - **重新初始化资源**：`init_resources` 选 `true`（一般不需要，幂等安全）
+
+---
+
+## 前端静态资源
+
+前端 Vue 3 SPA 位于 `frontend/` 子目录，与 Rust Worker 集成在同一个 Cloudflare Workers 部署中。
+
+### 架构说明
+
+| 组件 | 技术栈 | 说明 |
+|---|---|---|
+| 后端 API | Rust + Workers | 处理 `/api/*` 和 `/admin/*` 路由 |
+| 前端 SPA | Vue 3 + Vite + Tailwind CSS | 其余所有路径由 Static Assets 服务 |
+
+**工作原理**：
+1. 所有请求优先进入 Rust Worker（`run_worker_first = true`）
+2. 路径以 `/api` 或 `/admin` 开头 → Rust 路由处理
+3. 其他路径 → 转发给 `ASSETS` fetcher 服务静态文件
+4. 未匹配的路径（如 `/about`）→ 返回 `index.html`，由 Vue Router 处理（SPA 路由）
+
+### 构建流程
+
+CI 中的构建顺序：
+```
+frontend/ npm ci + npm run build  →  dist/（静态文件）
+worker-build --release            →  build/worker/（WASM）
+wrangler deploy --no-build        →  部署 dist/ + build/ 到 Cloudflare
+```
+
+本地构建（等同于 `wrangler dev` / `wrangler deploy` 时自动执行）：
+```bash
+cd frontend && npm ci && npm run build
+cd .. && worker-build --release
+```
+
+### 自定义前端配置
+
+修改 `frontend/src/config.js` 可配置：
+- `SITE_*`：站点标题、描述等显示信息
+- Giscus 评论配置（由后端 `pageConfig` API 动态下发，也可在 `wrangler.toml` 的 `[vars]` 中设置）
+
+> **注意**：`API_BASE` 已设置为 `/api`（相对路径），前端与 Worker 同域部署无需修改。
 
 ---
 

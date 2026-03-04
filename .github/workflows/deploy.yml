@@ -9,6 +9,7 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'wrangler.toml'
+      - 'frontend/**'
   # 手动触发（一键部署/更新 + 可选初始化/迁移）
   workflow_dispatch:
     inputs:
@@ -183,7 +184,22 @@ jobs:
         with:
           ref: ${{ github.ref }}
 
-      # ========== 2. 安装 Rust (wasm32 target) ==========
+      # ========== 2. 安装 Node.js (构建前端) ==========
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ========== 2.5 缓存 npm ==========
+      - name: Cache npm
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # ========== 3. 安装 Rust (wasm32 target) ==========
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -203,12 +219,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      # ========== 4. 安装 worker-build ==========
+      # ========== 4. 构建前端静态资源 ==========
+      - name: Build Frontend
+        run: cd frontend && npm ci && npm run build
+
+      # ========== 5. 安装 worker-build ==========
       - name: Install worker-build
         run: cargo install worker-build --quiet 2>/dev/null || true
 
-      # ========== 5. 构建 WASM Worker ==========
-      - name: Build
+      # ========== 6. 构建 WASM Worker ==========
+      - name: Build WASM
         run: worker-build --release
 
       # ========== 6. D1 数据库迁移 ==========
@@ -226,7 +246,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: deploy
+          command: deploy --no-build
           secrets: |
             SECRET
             ADMIN_PASSWD
