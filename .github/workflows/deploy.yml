@@ -1,0 +1,253 @@
+name: Deploy to Cloudflare Workers
+
+on:
+  # 推送到 main 分支自动部署（一键更新）
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'wrangler.toml'
+  # 手动触发（一键部署/更新 + 可选初始化/迁移）
+  workflow_dispatch:
+    inputs:
+      init_resources:
+        description: '初始化 Cloudflare 资源（首次部署选 true，会自动创建 D1/KV 并写入 wrangler.toml）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      run_migrations:
+        description: '执行数据库迁移（首次部署或有新迁移文件时选 true）'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+
+# 同一时间只允许一个部署，新的部署会等待旧的完成
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  WRANGLER_TOML: wrangler.toml
+  D1_DATABASE_NAME: runtime-tracker-db
+  KV_NAMESPACE_TITLE: runtime-tracker-kv
+
+jobs:
+  # ==========================================
+  # Job 1: 初始化 Cloudflare 资源（仅首次部署）
+  # ==========================================
+  setup:
+    name: Init Resources
+    runs-on: ubuntu-latest
+    if: github.event.inputs.init_resources == 'true'
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install wrangler
+        run: npm install -g wrangler
+
+      # ---- 创建 D1 数据库（幂等） ----
+      - name: Create D1 Database
+        id: d1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          DB_NAME="${{ env.D1_DATABASE_NAME }}"
+          echo "🔍 检查 D1 数据库 '$DB_NAME' 是否已存在..."
+
+          EXISTING=$(wrangler d1 list --json 2>/dev/null | jq -r ".[] | select(.name == \"$DB_NAME\") | .uuid" || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            echo "✅ D1 数据库已存在，ID: $EXISTING"
+            echo "database_id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            echo "📦 创建 D1 数据库 '$DB_NAME'..."
+            CREATE_OUTPUT=$(wrangler d1 create "$DB_NAME" 2>&1)
+            echo "$CREATE_OUTPUT"
+            DB_ID=$(echo "$CREATE_OUTPUT" | grep -oP 'database_id\s*=\s*"\K[^"]+' || \
+                     echo "$CREATE_OUTPUT" | grep -oP '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+            if [ -z "$DB_ID" ]; then
+              echo "❌ 无法提取 database_id，请检查输出"
+              exit 1
+            fi
+            echo "✅ D1 数据库创建成功，ID: $DB_ID"
+            echo "database_id=$DB_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- 创建 KV 命名空间（幂等） ----
+      - name: Create KV Namespace
+        id: kv
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          KV_TITLE="${{ env.KV_NAMESPACE_TITLE }}"
+          echo "🔍 检查 KV 命名空间 '$KV_TITLE' 是否已存在..."
+
+          EXISTING=$(wrangler kv namespace list --json 2>/dev/null | jq -r ".[] | select(.title == \"$KV_TITLE\") | .id" || echo "")
+
+          if [ -n "$EXISTING" ]; then
+            echo "✅ KV 命名空间已存在，ID: $EXISTING"
+            echo "namespace_id=$EXISTING" >> "$GITHUB_OUTPUT"
+          else
+            echo "📦 创建 KV 命名空间 '$KV_TITLE'..."
+            CREATE_OUTPUT=$(wrangler kv namespace create "$KV_TITLE" 2>&1)
+            echo "$CREATE_OUTPUT"
+            KV_ID=$(echo "$CREATE_OUTPUT" | grep -oP 'id\s*=\s*"\K[^"]+' || \
+                    echo "$CREATE_OUTPUT" | grep -oP '[0-9a-f]{32}')
+            if [ -z "$KV_ID" ]; then
+              echo "❌ 无法提取 KV namespace id，请检查输出"
+              exit 1
+            fi
+            echo "✅ KV 命名空间创建成功，ID: $KV_ID"
+            echo "namespace_id=$KV_ID" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ---- 更新 wrangler.toml ----
+      - name: Update wrangler.toml
+        run: |
+          D1_ID="${{ steps.d1.outputs.database_id }}"
+          KV_ID="${{ steps.kv.outputs.namespace_id }}"
+          TOML_FILE="${{ env.WRANGLER_TOML }}"
+
+          echo "📝 更新 wrangler.toml..."
+          sed -i "s/database_id = \"[^\"]*\"/database_id = \"$D1_ID\"/" "$TOML_FILE"
+
+          awk -v kv_id="$KV_ID" '
+            /^\[\[kv_namespaces\]\]/ { in_kv=1 }
+            in_kv && /^id = / { $0 = "id = \"" kv_id "\""; in_kv=0 }
+            /^\[/ && !/^\[\[kv_namespaces\]\]/ { in_kv=0 }
+            { print }
+          ' "$TOML_FILE" > "${TOML_FILE}.tmp" && mv "${TOML_FILE}.tmp" "$TOML_FILE"
+
+          echo "✅ wrangler.toml 已更新"
+          grep -A2 'kv_namespaces\|d1_databases' "$TOML_FILE"
+
+      # ---- 提交变更 ----
+      - name: Commit & Push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${{ env.WRANGLER_TOML }}"
+
+          if git diff --cached --quiet; then
+            echo "ℹ️ wrangler.toml 无变更（资源 ID 已是最新）"
+          else
+            git commit -m "chore: auto-configure Cloudflare resource IDs [skip ci]"
+            git push
+            echo "✅ wrangler.toml 已提交并推送"
+          fi
+
+      - name: Setup Summary
+        run: |
+          echo "## 🏗️ 资源初始化完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 资源 | ID |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **D1** \`${{ env.D1_DATABASE_NAME }}\` | \`${{ steps.d1.outputs.database_id }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **KV** \`${{ env.KV_NAMESPACE_TITLE }}\` | \`${{ steps.kv.outputs.namespace_id }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ==========================================
+  # Job 2: 构建 & 部署
+  # ==========================================
+  deploy:
+    name: Build & Deploy
+    runs-on: ubuntu-latest
+    # 如果 setup 运行了就等它完成，否则直接开始
+    needs: setup
+    if: always() && (needs.setup.result == 'success' || needs.setup.result == 'skipped')
+    timeout-minutes: 20
+
+    steps:
+      # ========== 1. 检出代码（拉取 setup 可能推送的最新 wrangler.toml） ==========
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      # ========== 2. 安装 Rust (wasm32 target) ==========
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      # ========== 3. 缓存 Cargo 注册表 + 构建产物 ==========
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # ========== 4. 安装 worker-build ==========
+      - name: Install worker-build
+        run: cargo install worker-build --quiet 2>/dev/null || true
+
+      # ========== 5. 构建 WASM Worker ==========
+      - name: Build
+        run: worker-build --release
+
+      # ========== 6. D1 数据库迁移 ==========
+      - name: Run D1 Migrations
+        if: github.event.inputs.run_migrations == 'true' || github.event.inputs.init_resources == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: d1 migrations apply ${{ env.D1_DATABASE_NAME }} --remote
+
+      # ========== 7. 部署 Worker ==========
+      - name: Deploy
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: deploy
+          secrets: |
+            SECRET
+            ADMIN_PASSWD
+            AI_API_KEY
+        env:
+          SECRET: ${{ secrets.SECRET }}
+          ADMIN_PASSWD: ${{ secrets.ADMIN_PASSWD }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+
+      # ========== 8. 部署摘要 ==========
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 部署摘要" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| 项目 | 值 |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| **状态** | \`${{ job.status }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **分支** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **提交** | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **触发方式** | \`${{ github.event_name }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **初始化资源** | \`${{ github.event.inputs.init_resources || 'false' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **数据库迁移** | \`${{ github.event.inputs.run_migrations || github.event.inputs.init_resources || 'false' }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **时间** | $(date -u '+%Y-%m-%d %H:%M:%S UTC') |" >> $GITHUB_STEP_SUMMARY

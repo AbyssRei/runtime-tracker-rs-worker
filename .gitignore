@@ -1,0 +1,36 @@
+# ========================
+# Rust / Cargo
+# ========================
+target/
+debug/
+build/
+pkg/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+**/mutants.out*/
+
+# ========================
+# Cloudflare Workers
+# ========================
+.wrangler/
+.dev.vars
+
+# ========================
+# Dependencies
+# ========================
+node_modules/
+
+# ========================
+# IDE / Editor
+# ========================
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ========================
+# OS
+# ========================
+.DS_Store
+Thumbs.db
